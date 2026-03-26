@@ -1,5 +1,6 @@
 import type { Telegraf } from "telegraf";
 import type Database from "better-sqlite3";
+import { getCommandDbChatId } from "./telegramScope.js";
 import {
   addWatched,
   getSettings,
@@ -18,7 +19,7 @@ import {
 import {
   escapeHtml,
   formatFdvUsd,
-  formatListDelta,
+  formatListDeltaPercent,
   formatUsdPrice,
   pctChangeEmoji,
 } from "./format.js";
@@ -41,14 +42,16 @@ function parseAddressesFromAddCommand(fullText: string): string[] {
   return [...new Set(m.map((x) => x.toLowerCase()))];
 }
 
-export function registerCommands(
-  bot: Telegraf,
-  db: Database.Database,
-  codexKey: string
-) {
+export function registerCommands(bot: Telegraf, db: Database.Database) {
   bot.command("add", async (ctx) => {
-    const chatId = ctx.chat!.id;
-    const addrs = parseAddressesFromAddCommand(ctx.message.text);
+    const scope = getCommandDbChatId(ctx);
+    if (!scope.ok) {
+      await ctx.reply(scope.message);
+      return;
+    }
+    const chatId = scope.dbChatId;
+    const rawText = ctx.message?.text ?? "";
+    const addrs = parseAddressesFromAddCommand(rawText);
 
     if (addrs.length === 0) {
       await ctx.reply(
@@ -72,7 +75,7 @@ export function registerCommands(
 
     let batchSnaps: Map<string, TokenSnapshot>;
     try {
-      batchSnaps = await fetchTokenSnapshots(codexKey, addrs);
+      batchSnaps = await fetchTokenSnapshots(addrs);
     } catch (e) {
       await ctx.reply(`Codex hatası: ${escapeHtml((e as Error).message)}`, {
         parse_mode: "HTML",
@@ -83,7 +86,7 @@ export function registerCommands(
     let added = 0;
     let duplicate = 0;
     const failLines: string[] = [];
-    let onlyAdded: { addr: string; snap: TokenSnapshot } | null = null;
+    const addedItems: { addr: string; snap: TokenSnapshot }[] = [];
 
     for (const addr of addrs) {
       if (hasWatched(db, chatId, addr)) {
@@ -94,7 +97,7 @@ export function registerCommands(
       let snap: TokenSnapshot | null | undefined = batchSnaps.get(addr);
       if (!snap) {
         try {
-          snap = await fetchTokenForAdd(codexKey, addr);
+          snap = await fetchTokenForAdd(addr);
         } catch (err) {
           failLines.push(
             `<code>${addr}</code> — ${escapeHtml((err as Error).message)}`
@@ -104,8 +107,9 @@ export function registerCommands(
       }
 
       if (!snap) {
+        const b = `https://basescan.org/token/${addr}`;
         failLines.push(
-          `<code>${addr}</code> — bulunamadı / indeks yok`
+          `<code>${addr}</code> — Codex Base (8453) veri yok (yanlış ağ / henüz takas indeksi yok / çok yeni). <a href="${b}">BaseScan</a>`
         );
         continue;
       }
@@ -117,46 +121,75 @@ export function registerCommands(
         symbol: snap.symbol,
       });
       added++;
-      if (addrs.length === 1) onlyAdded = { addr, snap };
+      addedItems.push({ addr, snap });
     }
 
-    if (onlyAdded) {
-      const { addr, snap } = onlyAdded;
+    if (addedItems.length > 0) {
+      const blocks = addedItems.map(
+        ({ addr, snap }) =>
+          [
+            `✅ ${escapeHtml(snap.name)} (${escapeHtml(snap.symbol)})`,
+            `💰 ${formatUsdPrice(snap.priceUsd)} | 📈 FDV: ${formatFdvUsd(snap.fdvUsd)}`,
+            `<code>${addr}</code>`,
+          ].join("\n")
+      );
+      const footer: string[] = [];
+      if (duplicate > 0) footer.push(`ℹ️ Zaten listede: ${duplicate}`);
+      if (failLines.length) {
+        footer.push("", "<b>Hatalar</b>", ...failLines.slice(0, 12));
+        if (failLines.length > 12) {
+          footer.push(`… +${failLines.length - 12}`);
+        }
+      }
+      let msg = ["🟢 <b>Eklenen Tokenler:</b>", "", ...blocks].join("\n\n");
+      if (footer.length) msg += "\n\n" + footer.join("\n");
+      if (msg.length > 4000) msg = msg.slice(0, 3990) + "\n…";
+      await ctx.reply(msg, { parse_mode: "HTML" });
+      return;
+    }
+
+    if (
+      added === 0 &&
+      duplicate === addrs.length &&
+      failLines.length === 0
+    ) {
+      if (addrs.length === 1) {
+        await ctx.reply(
+          [
+            "ℹ️ Bu adres <b>zaten takip listende</b>.",
+            `<code>${addrs[0]}</code>`,
+            "/list ile doğrulayabilirsin.",
+          ].join("\n"),
+          { parse_mode: "HTML" }
+        );
+        return;
+      }
       await ctx.reply(
-        [
-          "Eklendi:",
-          `🔹 ${escapeHtml(snap.name)} (${escapeHtml(snap.symbol)})`,
-          `<code>${addr}</code>`,
-          `Fiyat: ${formatUsdPrice(snap.priceUsd)}`,
-          `FDV: ${formatFdvUsd(snap.fdvUsd)}`,
-        ].join("\n"),
+        `ℹ️ Yazdığın <b>tüm adresler</b> zaten listede (${duplicate} adet). /list`,
         { parse_mode: "HTML" }
       );
       return;
     }
 
     const parts = [
-      "<b>Toplu ekleme özeti</b>",
-      `Eklendi: ${added}`,
+      "Hiç token eklenmedi.",
       `Zaten listede: ${duplicate}`,
       `Başarısız: ${failLines.length}`,
     ];
     if (failLines.length) {
       parts.push("", "<b>Hatalar</b>", ...failLines.slice(0, 15));
-      if (failLines.length > 15) {
-        parts.push(`… +${failLines.length - 15} satır`);
-      }
+      if (failLines.length > 15) parts.push(`… +${failLines.length - 15}`);
     }
-
-    let msg = parts.join("\n");
-    if (msg.length > 4000) {
-      msg = msg.slice(0, 3990) + "\n…";
-    }
-    await ctx.reply(msg, { parse_mode: "HTML" });
+    await ctx.reply(parts.join("\n"), { parse_mode: "HTML" });
   });
 
   bot.command("remove", async (ctx) => {
-    const parts = ctx.message.text.split(/\s+/).slice(1);
+    const scope = getCommandDbChatId(ctx);
+    if (!scope.ok) {
+      await ctx.reply(scope.message);
+      return;
+    }
+    const parts = (ctx.message?.text ?? "").split(/\s+/).slice(1);
     const addr = parseAddress(parts[0]);
     if (!addr) {
       await ctx.reply("Kullanım: <code>/remove 0x...</code>", {
@@ -164,12 +197,17 @@ export function registerCommands(
       });
       return;
     }
-    const ok = removeWatched(db, ctx.chat!.id, addr);
+    const ok = removeWatched(db, scope.dbChatId, addr);
     await ctx.reply(ok ? "Silindi." : "Listede yok.");
   });
 
   bot.command("list", async (ctx) => {
-    const rows = listWatched(db, ctx.chat!.id);
+    const scope = getCommandDbChatId(ctx);
+    if (!scope.ok) {
+      await ctx.reply(scope.message);
+      return;
+    }
+    const rows = listWatched(db, scope.dbChatId);
     if (!rows.length) {
       await ctx.reply("Liste boş. <code>/add 0x...</code>", {
         parse_mode: "HTML",
@@ -185,16 +223,16 @@ export function registerCommands(
           ? ((t.price_usd - t.prev_price_usd) / t.prev_price_usd) * 100
           : 0;
       const emoji = pctChangeEmoji(pct);
-      const deltaStr = formatListDelta(pct);
+      const deltaStr = formatListDeltaPercent(pct);
       const priceStr =
         t.price_usd != null ? formatUsdPrice(t.price_usd) : "—";
       const fdvStr = t.fdv_usd != null ? formatFdvUsd(t.fdv_usd) : "—";
       lines.push(
         `🔹 ${escapeHtml(t.name)} (${escapeHtml(t.symbol)})`,
         `<code>${t.address}</code>`,
-        `Fiyat: ${priceStr}`,
-        `Değişim: ${deltaStr} ${emoji}`,
-        `FDV: ${fdvStr}`,
+        `💰 Fiyat: ${priceStr}`,
+        `📊 Değişim: ${emoji} ${deltaStr}`,
+        `📈 FDV: ${fdvStr}`,
         ""
       );
     }
@@ -202,7 +240,12 @@ export function registerCommands(
   });
 
   bot.command("alert", async (ctx) => {
-    const parts = ctx.message.text.split(/\s+/).slice(1);
+    const scope = getCommandDbChatId(ctx);
+    if (!scope.ok) {
+      await ctx.reply(scope.message);
+      return;
+    }
+    const parts = (ctx.message?.text ?? "").split(/\s+/).slice(1);
     const n = parseFloat(parts[0]);
     if (!Number.isFinite(n) || n <= 0) {
       await ctx.reply("Kullanım: <code>/alert 5</code> (pozitif yüzde)", {
@@ -210,23 +253,38 @@ export function registerCommands(
       });
       return;
     }
-    setAlertPercent(db, ctx.chat!.id, n);
+    setAlertPercent(db, scope.dbChatId, n);
     await ctx.reply(`Uyarı eşiği: %${n} (fiyat değişimi, mutlak değer).`);
   });
 
   bot.command("pause", async (ctx) => {
-    setPaused(db, ctx.chat!.id, true);
+    const scope = getCommandDbChatId(ctx);
+    if (!scope.ok) {
+      await ctx.reply(scope.message);
+      return;
+    }
+    setPaused(db, scope.dbChatId, true);
     await ctx.reply("Takip durduruldu. /resume ile devam.");
   });
 
   bot.command("resume", async (ctx) => {
-    setPaused(db, ctx.chat!.id, false);
+    const scope = getCommandDbChatId(ctx);
+    if (!scope.ok) {
+      await ctx.reply(scope.message);
+      return;
+    }
+    setPaused(db, scope.dbChatId, false);
     await ctx.reply("Takip devam ediyor.");
   });
 
   bot.command("start", async (ctx) => {
-    getSettings(db, ctx.chat!.id);
-    const p = isPaused(db, ctx.chat!.id);
+    const scope = getCommandDbChatId(ctx);
+    if (!scope.ok) {
+      await ctx.reply(scope.message);
+      return;
+    }
+    getSettings(db, scope.dbChatId);
+    const p = isPaused(db, scope.dbChatId);
     await ctx.reply(
       [
         "Virtuals Token Tracker (Base)",

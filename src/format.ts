@@ -29,15 +29,9 @@ export function pctChangeEmoji(pct: number): string {
   return pct > 0 ? "🟢" : "🔴";
 }
 
-/** Listede: +%0.63, -%1.78 veya ~0 */
-export function formatListDelta(pct: number): string {
+/** Listede (emoji ayrı): %0.00, +%0.63, %-0.45 */
+export function formatListDeltaPercent(pct: number): string {
   if (!Number.isFinite(pct) || Math.abs(pct) < 0.005) return `%0.00`;
   if (pct > 0) return `+%${pct.toFixed(2)}`;
-  return `-%${Math.abs(pct).toFixed(2)}`;
-}
-
-export function formatAlertDelta(pct: number): string {
-  if (pct > 0) return `+%${pct.toFixed(2)}`;
-  if (pct < 0) return `-%${Math.abs(pct).toFixed(2)}`;
-  return `%0.00`;
+  return `%${pct.toFixed(2)}`;
 }
